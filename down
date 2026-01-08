@@ -1,0 +1,88 @@
+#!/bin/bash
+
+# Default values
+input_file=""
+output_dir="archived_js"
+
+# Parse command-line options
+while getopts ":u:o:" opt; do
+  case $opt in
+    u)
+      input_file="$OPTARG"
+      ;;
+    o)
+      output_dir="$OPTARG"
+      ;;
+    \?)
+      echo "Invalid option: -$OPTARG" >&2
+      exit 1
+      ;;
+    :)
+      echo "Option -$OPTARG requires an argument." >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Check if input file was provided
+if [[ -z "$input_file" ]]; then
+  echo "Usage: $0 -u <input_file> [-o <output_dir>]"
+  exit 1
+fi
+
+if [[ ! -f "$input_file" ]]; then
+  echo "[-] File not found: $input_file"
+  exit 1
+fi
+
+mkdir -p "$output_dir"
+
+while IFS= read -r url || [[ -n "$url" ]]; do
+    [[ -z "$url" ]] && continue
+
+    echo "[*] Processing $url"
+
+    # Create clean filename
+    filename=$(echo "$url" | sed 's|https\?://||; s|/|_|g; s|&|_|g; s|=|_|g')
+    filename="$output_dir/$filename"
+
+    # First try to download from live URL
+    echo "    [+] Trying live URL..."
+    http_status=$(curl -s -m 10 --connect-timeout 5 -o "$filename.live" -w "%{http_code}" "$url")
+    
+    if [[ "$http_status" == "200" ]]; then
+        # Live download successful, use this file
+        mv "$filename.live" "$filename"
+        echo "    [+] Successfully downloaded from live URL"
+    else
+        # Live failed, try Wayback Machine
+        echo "    [-] Live download failed (status: $http_status), trying Wayback Machine..."
+        rm -f "$filename.live"
+        
+        # Query CDX API for archived snapshots
+        api_url="http://web.archive.org/cdx/search/cdx?url=$url&output=json&fl=timestamp,original&filter=statuscode:200"
+        snapshot_json=$(curl -s "$api_url")
+
+        # Extract the latest snapshot if available
+        timestamp=$(echo "$snapshot_json" | jq -r '.[1][0] // empty')
+
+        if [[ -z "$timestamp" ]]; then
+            echo "    [-] No archive found, skipping."
+            continue
+        fi
+
+        archived_url="https://web.archive.org/web/${timestamp}id_/${url}"
+        echo "    [+] Found archived snapshot: $archived_url"
+
+        # Download from archive
+        curl -s -L -m 15 --connect-timeout 5 "$archived_url" -o "$filename"
+
+        if [[ $? -eq 0 ]]; then
+            echo "    [+] Saved from archive as $filename"
+        else
+            echo "    [-] Failed to download from archive."
+            rm -f "$filename"
+        fi
+    fi
+
+done < "$input_file"

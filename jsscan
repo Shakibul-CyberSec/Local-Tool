@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+import os
+import re
+import sys
+
+class SecretScanner:
+    def __init__(self):
+        # More specific patterns with better context
+        self.patterns = {
+            "Google API Key": r'AIza[0-9A-Za-z\-_]{35}',
+            "AWS AppSync Key": r'da2-[a-z0-9]{16}',
+            "JWT Token": r'\beyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*\b',
+            
+            # Much stricter password pattern - only catches actual assignments
+            "Password": r'(?i)(?:(?:password|passwd|pwd)\s*[=:]\s*["\']([^"\'\s]{8,64})["\']|(?:["\']password["\']\s*:\s*["\']([^"\'\s]{8,64})["\']))',
+            
+            # More specific generic secrets - avoids enum values
+            "API Secret": r'(?i)(?:secret|secret_key|api_secret|client_secret)\s*[=:]\s*["\']([a-zA-Z0-9_\-=/+]{16,64})["\']',
+            "Access Token": r'(?i)(?:access_token|bearer_token|auth_token)\s*[=:]\s*["\']([a-zA-Z0-9_\-=/+]{16,64})["\']',
+        }
+        
+        # Expanded false positives
+        self.false_positives = {
+            'null', 'undefined', 'true', 'false', 'password', 'secret', 'token', 'key',
+            'example', 'test', 'dummy', 'placeholder', 'string', 'value', 'type', 'name',
+            'HeaderBearerToken', 'CustomHeaderToken', 'MultiHeaderToken', 'QueryParamToken',
+            'OAuth2', 'AWSAssumeRole', 'WebBasic', 'Various', 'None', 'COPY_DOC',
+            'CREATE_API_TOKEN', 'CREATE_MAKER_PROFILE', 'lastActivePage', 'growSumoPartnerKey'
+        }
+        
+        # Patterns that indicate false positives
+        self.false_positive_patterns = [
+            r'\.create\({.*key:["\'][^"\']+["\']',
+            r'e\.\w+=["\'][^"\']+["\']',
+            r'value:["\'][^"\']+["\']',
+            r'enum\s+\w+\s*{',
+            r'e\.\w+="[^"]+"',
+            r'return\s+{[^}]*key:',
+            r'icons?:\s*{[^}]*}',
+            r'tooltipHeading:',
+            r'illustration:',
+            r'message:',
+            r'title:',
+        ]
+
+    def is_likely_false_positive(self, line, value):
+        """Check if the finding is likely a false positive"""
+        if value.lower() in self.false_positives:
+            return True
+            
+        # Check against false positive patterns
+        for pattern in self.false_positive_patterns:
+            if re.search(pattern, line):
+                return True
+                
+        # Check if it's likely an enum value or constant
+        if re.search(r'(?:e\.|=)\w*\s*=\s*["\'][^"\']+["\']', line) and not re.search(r'(?:secret|password|token|key)\s*[=:]', line, re.I):
+            return True
+            
+        # Check if it's a React component key or similar
+        if re.search(r'key:\s*["\'][^"\']+["\']', line) and not re.search(r'api|secret|password|token', line, re.I):
+            return True
+            
+        return False
+
+    def scan_file(self, file_path: str):
+        findings = []
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+                lines = content.split('\n')
+                
+                for line_num, line in enumerate(lines, 1):
+                    # Skip obvious false positive lines early
+                    if any(fp in line for fp in ['e.None=', 'e.HeaderBearerToken=', 'e.CustomHeaderToken=']):
+                        continue
+                        
+                    for secret_name, pattern in self.patterns.items():
+                        for match in re.finditer(pattern, line):
+                            # Extract the actual value
+                            groups = match.groups()
+                            value = None
+                            
+                            if groups:
+                                # Find the first non-None group (for patterns with multiple capture groups)
+                                for group in groups:
+                                    if group:
+                                        value = group
+                                        break
+                            if not value:
+                                value = match.group(0)
+                                
+                            if value and not self.is_likely_false_positive(line, value):
+                                # Get clean context
+                                start = max(0, match.start() - 30)
+                                end = min(len(line), match.end() + 30)
+                                context = line[start:end].strip()
+                                
+                                # Clean up context
+                                context = re.sub(r'[\x00-\x1F]', '', context)
+                                context = re.sub(r'\s+', ' ', context)
+                                
+                                findings.append((secret_name, context, line_num))
+                                
+        except Exception as e:
+            print(f"Error scanning {file_path}: {str(e)}", file=sys.stderr)
+        
+        return findings
+
+    def scan_directory(self, directory: str):
+        results = {}
+        js_files = []
+        
+        for root, _, files in os.walk(directory):
+            for file in files:
+                if file.endswith('.js'):
+                    full_path = os.path.join(root, file)
+                    js_files.append(full_path)
+        
+        print(f"Found {len(js_files)} JavaScript files to scan...")
+        
+        for i, file_path in enumerate(js_files):
+            if i % 100 == 0:
+                print(f"Scanned {i}/{len(js_files)} files...")
+                
+            findings = self.scan_file(file_path)
+            if findings:
+                results[file_path] = findings
+                
+        return results
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python secret_scanner.py <directory>")
+        sys.exit(1)
+    
+    target_dir = sys.argv[1]
+    scanner = SecretScanner()
+    results = scanner.scan_directory(target_dir)
+    
+    if not results:
+        print("No secrets found")
+        return
+    
+    total_findings = sum(len(v) for v in results.values())
+    print(f"\nFound {total_findings} potential secrets across {len(results)} files:\n")
+    
+    for file_path, findings in results.items():
+        rel_path = os.path.relpath(file_path, target_dir)
+        print(f"\nFile: {rel_path}")
+        
+        for secret_type, context, line_num in findings:
+            # Smart truncation
+            if len(context) > 120:
+                # Try to keep the important part
+                important_part = re.search(r'[A-Za-z0-9_\-=+/]{15,}', context)
+                if important_part:
+                    important = important_part.group(0)
+                    start = context.find(important)
+                    context = context[max(0, start-20):start+len(important)+20]
+                    if start > 20:
+                        context = "..." + context
+                    if len(context) > 100:
+                        context = context[:100] + "..."
+            
+            print(f"  Line {line_num}: [{secret_type}] {context}")
+
+if __name__ == "__main__":
+    main()
